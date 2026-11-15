@@ -193,36 +193,43 @@ def scene_a(cv):
         for x in range(0, W, 4):
             y = y_top + 16 * math.sin(x * 0.008 + i * 1.7)
             cv.span(x, x + 3, int(y), (255, 196, 120), 0.28)
+    # Pink glow the bell casts down onto the terraces.
+    cv.radial(540, 780, 320, (255, 130, 190), peak=0.10)
     # The jellyfish: halo, dome, inner glow, highlight.
     cv.radial(540, 330, 380, (255, 120, 200), peak=0.32)
     cv.ellipse(540, 344, 258, 172, (198, 82, 182), alpha=0.55)
     cv.ellipse(540, 330, 250, 165, (255, 150, 210), alpha=0.92)
     cv.ellipse(540, 322, 182, 116, (255, 200, 232), alpha=0.8)
-    cv.ellipse(472, 276, 118, 58, (255, 238, 246), alpha=0.7)
-    # Dome ribs: faint curved seams.
+    cv.ellipse(462, 268, 95, 46, (255, 238, 246), alpha=0.6)
+    # Soft rim light under the bell so it reads as a dome, not a disc.
+    cv.ellipse(540, 468, 240, 22, (255, 170, 215), alpha=0.35)
+    # Dome ribs: curved seams following the bell's curve.
     for k in range(-2, 3):
         x0 = 540 + k * 62
-        cv.line(x0, 200 + abs(k) * 22, x0 + k * 14, 462, 4.0,
-                (255, 210, 235), alpha=0.35)
-    # Oral arms: four broad wavy ribbons.
+        for s in range(0, 41):
+            t = s / 40.0
+            x = x0 + k * 14 * t * t - 8 * k * t * (1 - t)
+            y = (196 + abs(k) * 24) + t * (462 - (196 + abs(k) * 24))
+            cv.disc(x, y, 2.6, (255, 210, 235), alpha=0.3)
+    # Oral arms: four broad wavy ribbons, smooth (overlapping stamps).
     for k, x0 in enumerate((430, 500, 580, 650)):
         phase = k * 1.3
-        for s in range(0, 220, 6):
+        for s in range(0, 220, 4):
             t = s / 220.0
             x = x0 + 30 * math.sin(s * 0.045 + phase)
             y = 460 + s
-            r = 15 - 9 * t
-            cv.disc(x, y, r, (255, 188, 220), alpha=0.55)
-    # Tentacles: seven long thin glowing threads.
+            r = 14 - 8 * t
+            cv.disc(x, y, r, (255, 188, 220), alpha=0.7)
+    # Tentacles: seven long thin glowing threads, smooth.
     for k in range(7):
         x0 = 380 + k * 53
         phase = k * 0.9
         col = (255, 170, 215) if k % 2 == 0 else (196, 132, 255)
-        for s in range(0, 300, 5):
+        for s in range(0, 300, 3):
             t = s / 300.0
             x = x0 + 26 * math.sin(s * 0.038 + phase)
             y = 468 + s
-            cv.disc(x, y, 6.5 - 4.5 * t, col, alpha=0.7)
+            cv.disc(x, y, 7.5 - 4.5 * t, col, alpha=0.8)
     # Drifting light motes around the bell.
     rng = random.Random(20261116)
     for _ in range(46):
