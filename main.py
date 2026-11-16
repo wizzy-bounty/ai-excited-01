@@ -1,545 +1,426 @@
 #!/usr/bin/env python3
-"""ai-excited-01 v5 — "Jellyfish Over the Terraces" (clean-room rebuild).
+"""ai-excited-01 v6 -- clean-room rebuild.
 
-A giant translucent jellyfish drifts low over golden-hour rice terraces:
-one colossal impossible subject in the wrong place, a tiny farmer with
-lanterns below for scale, a visible sun, and a bowl-perspective terrace
-foreground. Pure Python 3 stdlib, no network, no Pillow: a small software
-rasterizer plus a hand-rolled PNG encoder. Deterministic: the same bytes
-on every run.
+Draws "Jellyfish Over the Terraces": one colossal glowing jellyfish
+drifting low over terraced rice fields at dusk, a tiny farmer and three
+lanterns below for scale.
 
-Writes one image to $MAKEFUN_OUTPUT_DIR/entry.png (default /output).
-1024x1024, well under the 1 MiB gate.
+Pure Python 3 standard library. A small scanline rasterizer draws the
+picture into an RGB buffer (sky gradient, sun, mountains, terraced
+water, the jellyfish bell with ribs, wavy oral skirt, five oral arms
+and trailing tentacles, shimmer reflections, farmer silhouette and
+lanterns), then a hand-rolled encoder writes a PNG. No network, no
+clock, no randomness: two runs write byte-identical files.
+
+Usage:
+    mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
+Output: <MAKEFUN_OUTPUT_DIR>/entry.png (1024x1024, under 1 MiB).
 """
 
-import hashlib
 import math
 import os
 import struct
-import sys
 import zlib
 
 W = 1024
 H = 1024
 
-# ---------------------------------------------------------------- canvas
-px = bytearray(W * H * 3)
+buf = bytearray(W * H * 3)
 
+
+# ---------------------------------------------------------------- helpers
 
 def _clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-def set_px(x, y, r, g, b):
-    if 0 <= x < W and 0 <= y < H:
-        i = (y * W + x) * 3
-        px[i] = r
-        px[i + 1] = g
-        px[i + 2] = b
+def lerp(a, b, t):
+    return int(a + (b - a) * t)
 
 
-def blend_px(x, y, r, g, b, a):
-    """Blend color (r,g,b) over the pixel at (x,y) with alpha a in [0,1]."""
-    if a <= 0.0 or not (0 <= x < W and 0 <= y < H):
-        return
-    i = (y * W + x) * 3
-    if a >= 1.0:
-        px[i] = r
-        px[i + 1] = g
-        px[i + 2] = b
-        return
-    ia = 1.0 - a
-    px[i] = int(r * a + px[i] * ia + 0.5)
-    px[i + 1] = int(g * a + px[i + 1] * ia + 0.5)
-    px[i + 2] = int(b * a + px[i + 2] * ia + 0.5)
+def mix(c1, c2, t):
+    """Blend two RGB triples, t in [0, 1]."""
+    return (lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t))
 
 
-def hline(y, x0, x1, r, g, b):
-    """Solid horizontal span, inclusive, clipped."""
+def fill_span(y, x0, x1, rgb):
+    """Opaque horizontal span (fast slice fill)."""
     if y < 0 or y >= H:
         return
-    if x0 < 0:
-        x0 = 0
-    if x1 >= W:
-        x1 = W - 1
-    if x1 < x0:
+    x0 = _clamp(x0, 0, W)
+    x1 = _clamp(x1, 0, W)
+    if x0 >= x1:
         return
-    i = (y * W + x0) * 3
-    n = x1 - x0 + 1
-    px[i:i + n * 3] = bytes((r, g, b)) * n
+    r, g, b = rgb
+    row = y * W * 3
+    buf[row + x0 * 3: row + x1 * 3] = bytes((r, g, b)) * (x1 - x0)
 
 
-def hline_a(y, x0, x1, r, g, b, a):
-    """Alpha-blended horizontal span, inclusive, clipped."""
-    if a <= 0.0 or y < 0 or y >= H:
+def blend_span(y, x0, x1, rgb, alpha):
+    """Translucent horizontal span, alpha 0..255."""
+    if y < 0 or y >= H or alpha <= 0:
         return
-    if x0 < 0:
-        x0 = 0
-    if x1 >= W:
-        x1 = W - 1
-    if x1 < x0:
+    if alpha >= 255:
+        fill_span(y, x0, x1, rgb)
         return
-    if a >= 1.0:
-        hline(y, x0, x1, r, g, b)
+    x0 = _clamp(x0, 0, W)
+    x1 = _clamp(x1, 0, W)
+    if x0 >= x1:
         return
-    ia = 1.0 - a
+    r, g, b = rgb
+    ia = 255 - alpha
     base = (y * W + x0) * 3
-    for x in range(x0, x1 + 1):
-        i = base + (x - x0) * 3
-        px[i] = int(r * a + px[i] * ia + 0.5)
-        px[i + 1] = int(g * a + px[i + 1] * ia + 0.5)
-        px[i + 2] = int(b * a + px[i + 2] * ia + 0.5)
+    for i in range(x1 - x0):
+        o = base + i * 3
+        buf[o] = (r * alpha + buf[o] * ia) // 255
+        buf[o + 1] = (g * alpha + buf[o + 1] * ia) // 255
+        buf[o + 2] = (b * alpha + buf[o + 2] * ia) // 255
 
 
-def disc(cx, cy, rad, r, g, b, a=1.0):
-    """Filled disc, solid or alpha-blended."""
+def fill_vspan(x, y0, y1, rgb):
+    """Opaque vertical span."""
+    if x < 0 or x >= W:
+        return
+    y0 = _clamp(y0, 0, H)
+    y1 = _clamp(y1, 0, H)
+    r, g, b = rgb
+    for y in range(y0, y1):
+        o = (y * W + x) * 3
+        buf[o] = r
+        buf[o + 1] = g
+        buf[o + 2] = b
+
+
+def disc(cx, cy, rad, rgb, alpha=255):
+    """Filled circle (translucent when alpha < 255)."""
     if rad <= 0:
         return
-    for dy in range(-rad, rad + 1):
-        y = cy + dy
-        if 0 <= y < H:
-            dx = int(math.sqrt(rad * rad - dy * dy))
-            if a >= 1.0:
-                hline(y, cx - dx, cx + dx, r, g, b)
-            else:
-                hline_a(y, cx - dx, cx + dx, r, g, b, a)
-
-
-def line(x0, y0, x1, y1, r, g, b, width=1, a=1.0):
-    """DDA line; width>1 plots a small disc at each step."""
-    steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
-    if steps <= 1:
-        if width <= 1:
-            blend_px(x0, y0, r, g, b, a)
-        else:
-            disc(x0, y0, width // 2, r, g, b, a)
-        return
-    rad = width // 2
-    for i in range(steps + 1):
-        t = i / steps
-        x = int(x0 + (x1 - x0) * t + 0.5)
-        y = int(y0 + (y1 - y0) * t + 0.5)
-        if width <= 1:
-            blend_px(x, y, r, g, b, a)
-        else:
-            disc(x, y, rad, r, g, b, a)
-
-
-def polyfill(points, r, g, b):
-    """Scanline fill of a simple polygon (list of (x, y))."""
-    if len(points) < 3:
-        return
-    ys = [p[1] for p in points]
-    ymin = max(0, min(ys))
-    ymax = min(H - 1, max(ys))
-    edges = []
-    n = len(points)
-    for i in range(n):
-        x1, y1 = points[i]
-        x2, y2 = points[(i + 1) % n]
-        if y1 != y2:
-            edges.append((x1, y1, x2, y2))
-    for y in range(ymin, ymax + 1):
-        xs = []
-        for (x1, y1, x2, y2) in edges:
-            if (y1 <= y < y2) or (y2 <= y < y1):
-                xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
-        xs.sort()
-        for i in range(0, len(xs) - 1, 2):
-            hline(y, int(xs[i] + 0.5), int(xs[i + 1] + 0.5), r, g, b)
-
-
-def radial_glow(cx, cy, rx, ry, r, g, b, peak, step=1):
-    """Soft elliptical glow: alpha falls off quadratically to the edge.
-
-    step=2 samples every other pixel (2x2 blocks) — invisible for a soft
-    glow, much faster for large halos.
-    """
-    if peak <= 0.0:
-        return
-    for dy in range(-ry, ry + 1, step):
-        y = cy + dy
-        if y < 0 or y >= H:
+    for y in range(cy - rad, cy + rad + 1):
+        dy = y - cy
+        rest = rad * rad - dy * dy
+        if rest < 0:
             continue
-        ny = dy / ry
-        rem = 1.0 - ny * ny
-        if rem <= 0.0:
+        dx = math.isqrt(rest)
+        if alpha >= 255:
+            fill_span(y, cx - dx, cx + dx + 1, rgb)
+        else:
+            blend_span(y, cx - dx, cx + dx + 1, rgb, alpha)
+
+
+def ellipse_rows(cx, cy, rx, ry):
+    """Yield (y, x0, x1) spans of a filled ellipse."""
+    for y in range(cy - ry, cy + ry + 1):
+        t = (y - cy) / ry
+        rest = 1.0 - t * t
+        if rest < 0:
             continue
-        dxmax = int(rx * math.sqrt(rem))
-        for dx in range(-dxmax, dxmax + 1, step):
-            nx = dx / rx
-            d2 = nx * nx + ny * ny
-            if d2 >= 1.0:
-                continue
-            a = peak * (1.0 - d2)
-            if step == 1:
-                blend_px(cx + dx, y, r, g, b, a)
-            else:
-                for ox in range(step):
-                    for oy in range(step):
-                        blend_px(cx + dx + ox, y + oy, r, g, b, a)
+        hw = int(rx * math.sqrt(rest))
+        yield y, cx - hw, cx + hw + 1
 
 
-def lerp_color(c1, c2, t):
-    return (int(c1[0] + (c2[0] - c1[0]) * t + 0.5),
-            int(c1[1] + (c2[1] - c1[1]) * t + 0.5),
-            int(c1[2] + (c2[2] - c1[2]) * t + 0.5))
+def polyline_disc(points, rad, rgb, alpha=255, step=3):
+    """Thick wavy line: discs along a list of (x, y) points."""
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        dist = math.hypot(x1 - x0, y1 - y0)
+        n = max(1, int(dist / step))
+        for i in range(n + 1):
+            t = i / n
+            disc(int(lerp(x0, x1, t)), int(lerp(y0, y1, t)), rad, rgb, alpha)
 
-
-def gradient_row(stops, y, y0, y1):
-    """Multi-stop vertical gradient color at row y in [y0, y1]."""
-    t = (y - y0) / max(1, y1 - y0)
-    t = _clamp(t, 0.0, 1.0)
-    for i in range(len(stops) - 1):
-        t0, c0 = stops[i]
-        t1, c1 = stops[i + 1]
-        if t0 <= t <= t1:
-            f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
-            return lerp_color(c0, c1, f)
-    return stops[-1][1]
-
-
-# ------------------------------------------------------------- PNG output
-def _chunk(typ, data):
-    out = struct.pack(">I", len(data)) + typ + data
-    out += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-    return out
-
-
-def encode_png(w, h, buf):
-    raw = bytearray()
-    for y in range(h):
-        raw.append(0)  # filter: none
-        raw += buf[y * w * 3:(y + 1) * w * 3]
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n"
-            + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-            + _chunk(b"IEND", b""))
-
-
-def main():
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(outdir, exist_ok=True)
-    draw()
-    data = encode_png(W, H, px)
-    path = os.path.join(outdir, "entry.png")
-    with open(path, "wb") as f:
-        f.write(data)
-    print("wrote %s (%d bytes, sha256 %s)"
-          % (path, len(data), hashlib.sha256(data).hexdigest()))
-
-
-# (draw() is defined below; the __main__ guard goes at the very end.)
 
 # ------------------------------------------------------------------- sky
-SKY_STOPS = [
-    (0.00, (26, 14, 58)),     # deep violet night at the top
-    (0.20, (58, 32, 96)),
-    (0.42, (110, 52, 130)),   # magenta-purple
-    (0.62, (168, 62, 118)),
-    (0.80, (214, 92, 78)),    # orange-red
-    (0.95, (238, 138, 60)),   # golden orange at the horizon
-    (1.00, (244, 150, 66)),
-]
-
-HORIZON = 660  # where the sky meets the terraces
-
 
 def draw_sky():
-    for y in range(HORIZON + 1):
-        r, g, b = gradient_row(SKY_STOPS, y, 0, HORIZON)
-        hline(y, 0, W - 1, r, g, b)
+    """Dusk gradient: deep indigo top, magenta band, burning orange horizon."""
+    stops = [
+        (0.00, (24, 16, 62)),
+        (0.22, (58, 26, 96)),
+        (0.42, (128, 48, 118)),
+        (0.58, (214, 84, 96)),
+        (0.72, (255, 138, 62)),
+        (0.82, (255, 186, 92)),
+        (1.00, (255, 205, 120)),
+    ]
+    horizon = 560
+    for y in range(horizon + 1):
+        t = y / horizon
+        for i in range(len(stops) - 1):
+            t0, c0 = stops[i]
+            t1, c1 = stops[i + 1]
+            if t0 <= t <= t1:
+                f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                fill_span(y, 0, W, mix(c0, c1, f))
+                break
 
 
-def draw_stars():
-    # Deterministic LCG — same sky on every run, no random module state.
-    seed = 1234567
-    for _ in range(90):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        x = seed % W
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        y = seed % 300
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        bright = 150 + seed % 105
-        # Keep stars out of the bright dome halo area.
-        if 180 < x < 845 and y < 130:
-            continue
-        set_px(x, y, bright, bright, min(255, bright + 20))
-        if seed % 7 == 0:
-            set_px(x + 1, y, bright - 40, bright - 40, bright - 20)
-
-
-def draw_birds():
-    # Tiny dark chevrons, far away, for scale and life in the sky.
-    for (bx, by, s) in [(185, 195, 9), (255, 172, 7), (700, 118, 8),
-                        (858, 193, 9), (742, 148, 6)]:
-        line(bx - s, by, bx, by - 4, 30, 18, 48, width=2)
-        line(bx, by - 4, bx + s, by, 30, 18, 48, width=2)
-
-
-# ------------------------------------------------------------------- sun
 def draw_sun():
-    # Low golden sun at the right, mostly hidden behind the far ridge —
-    # only its glowing cap peeks above the silhouette.
-    sx, sy, sr = 768, 612, 48
-    radial_glow(sx, sy, 110, 75, 255, 190, 110, 0.35, step=2)
-    radial_glow(sx, sy, 70, 50, 255, 215, 140, 0.45, step=2)
-    disc(sx, sy, sr, 255, 233, 168)
-    disc(sx, sy, sr - 8, 255, 240, 190)
+    """Low sun with a wide warm halo, right of the jellyfish."""
+    cx, cy = 768, 330
+    disc(cx, cy, 150, (255, 150, 70), 26)
+    disc(cx, cy, 105, (255, 170, 80), 48)
+    disc(cx, cy, 76, (255, 196, 100), 110)
+    disc(cx, cy, 58, (255, 214, 130), 255)
+    disc(cx, cy, 46, (255, 238, 190), 255)
+    disc(cx, cy, 34, (255, 248, 220), 255)
 
 
-# -------------------------------------------------------------- mountains
+def draw_clouds():
+    """A few long dusk clouds, pink-lit underneath."""
+    for (cx, cy, rx, ry, alpha) in [
+        (210, 150, 190, 16, 70),
+        (300, 132, 130, 11, 60),
+        (820, 130, 170, 13, 66),
+        (880, 210, 210, 15, 58),
+        (150, 260, 150, 12, 52),
+        (620, 120, 120, 10, 55),
+    ]:
+        for y, x0, x1 in ellipse_rows(cx, cy, rx, ry):
+            blend_span(y, x0, x1, (255, 150, 130), alpha)
+        for y, x0, x1 in ellipse_rows(cx, cy + ry // 2, rx, ry // 2):
+            blend_span(y, x0, x1, (255, 110, 110), alpha // 2)
+
+
 def draw_mountains():
-    # Far ridge: dark violet, jagged peaks.
-    far = [(0, 665), (90, 625), (180, 640), (300, 595), (420, 620),
-           (540, 585), (650, 610), (760, 600), (870, 570), (960, 600),
-           (1024, 590), (1024, 668), (0, 668)]
-    polyfill(far, 36, 22, 64)
-    # Near ridge: a touch lighter, softer and lower.
-    near = [(0, 668), (150, 645), (320, 655), (500, 635), (680, 650),
-            (850, 640), (1024, 655), (1024, 672), (0, 672)]
-    polyfill(near, 58, 42, 94)
+    """Dark ridge silhouettes along the horizon."""
+    for y in range(470, 562):
+        for x0, x1 in _mountain_spans(y):
+            fill_span(y, x0, x1, (52, 30, 84))
+
+
+def _mountain_spans(y):
+    """Two overlapping ridge profiles, returned as x-intervals per row."""
+    spans = []
+    # Far ridge: a slow sine silhouette.
+    edge = 520 - int(46 * math.sin(y * 0.021) + 26 * math.sin(y * 0.047 + 2.0))
+    if y >= edge:
+        spans.append((0, W))
+    # Near ridge: a lower, lumpier silhouette on the left and right.
+    edge2 = 545 - int(20 * math.sin(y * 0.05 + 0.7) + 12 * math.sin(y * 0.11))
+    if y >= edge2:
+        spans.append((0, 300))
+        spans.append((760, W))
+    return spans
 
 
 # --------------------------------------------------------------- terraces
-# Terrace boundary curves: each sags down toward the middle (bowl
-# perspective). y(x) = edge + sag * (1 - ((x-512)/512)^2).
-TERRACE_CURVES = [
-    (652, 34), (688, 40), (726, 46), (766, 52),
-    (810, 58), (856, 64), (904, 70), (954, 76),
+
+TERRACE_TOP = 560
+
+# (band height, water colour at top of band, water colour at bottom)
+BANDS = [
+    (46, (232, 128, 74), (196, 96, 66)),
+    (50, (214, 108, 66), (150, 78, 70)),
+    (56, (188, 92, 62), (112, 66, 76)),
+    (62, (158, 80, 64), (84, 58, 82)),
+    (70, (128, 70, 66), (62, 52, 84)),
+    (78, (102, 62, 70), (46, 48, 84)),
+    (102, (82, 56, 74), (34, 44, 82)),
 ]
-TERRACE_GREENS = [(53, 112, 76), (90, 162, 79), (74, 143, 67),
-                  (90, 162, 79), (74, 143, 67), (90, 162, 79),
-                  (74, 143, 67), (90, 162, 79)]
-TERRACE_BASE = (63, 122, 68)
-TERRACE_GOLD = (232, 200, 122)
-
-
-def terrace_y(edge, sag, x):
-    t = (x - 512) / 512.0
-    return edge + sag * (1.0 - t * t)
 
 
 def draw_terraces():
-    # Base fill closes any gap at the horizon line.
-    for y in range(HORIZON, H):
-        hline(y, 0, W - 1, *TERRACE_BASE)
-    # Each band is the region between two curves. On a row y, band i
-    # covers |t| in [u_top, u_bot): two symmetric horizontal spans.
-    for i in range(len(TERRACE_CURVES)):
-        et, st = TERRACE_CURVES[i]
-        if i + 1 < len(TERRACE_CURVES):
-            eb, sb = TERRACE_CURVES[i + 1]
-        else:
-            eb, sb = H + 40, 76  # last band runs off the bottom edge
-        color = TERRACE_GREENS[i]
-        y_lo = et
-        y_hi = min(H - 1, int(eb + sb) + 1)
-        for y in range(y_lo, y_hi + 1):
-            # |t| >= u_top where the top curve is at or above this row.
-            if y >= et + st:
-                u_top = 0.0
-            elif y <= et:
-                u_top = 1.0
-            else:
-                u_top = math.sqrt(max(0.0, 1.0 - (y - et) / st))
-            # |t| < u_bot where the bottom curve is below this row.
-            if y <= eb:
-                u_bot = 1.0
-            elif y >= eb + sb:
-                u_bot = 0.0
-            else:
-                u_bot = math.sqrt(max(0.0, 1.0 - (y - eb) / sb))
-            if u_bot <= u_top:
-                continue
-            x_in0 = int(512 - 512 * u_bot)
-            x_in1 = int(512 - 512 * u_top)
-            x_out0 = int(512 + 512 * u_top)
-            x_out1 = int(512 + 512 * u_bot)
-            hline(y, x_in0, x_in1, *color)
-            hline(y, x_out0, x_out1, *color)
-    # Golden waterline along every curve.
-    for (edge, sag) in TERRACE_CURVES:
-        for x in range(0, W, 1):
-            y = int(terrace_y(edge, sag, x) + 0.5)
-            set_px(x, y, *TERRACE_GOLD)
-            if y + 1 < H:
-                blend_px(x, y + 1, 240, 214, 140, 0.7)
-    # The jellyfish's glow shimmering on the flooded terraces.
-    radial_glow(512, 800, 270, 55, 200, 180, 235, 0.22, step=2)
+    """Stacked flooded paddies: water mirrors the sky, walls stay dark."""
+    y = TERRACE_TOP
+    for bi, (bh, wtop, wbot) in enumerate(BANDS):
+        wall_h = max(6, bh // 4)
+        water_h = bh - wall_h
+        for yy in range(y, y + water_h):
+            t = (yy - y) / max(1, water_h)
+            fill_span(yy, 0, W, mix(wtop, wbot, t))
+        for yy in range(y + water_h, y + bh):
+            t = (yy - (y + water_h)) / max(1, wall_h)
+            fill_span(yy, 0, W, mix((26, 44, 36), (16, 28, 26), t))
+        # Thin bright rim where the water meets the wall.
+        fill_span(y + water_h, 0, W, (255, 190, 120) if bi < 2 else (120, 90, 90))
+        y += bh
+    # Perspective divider curves: field edges fanning down the slope.
+    for (x_top, x_bot, phase) in [(300, 180, 0.0), (700, 830, 1.3), (520, 470, 2.6)]:
+        pts = []
+        for i in range(25):
+            t = i / 24
+            xx = int(lerp(x_top, x_bot, t) + 14 * math.sin(t * 5.0 + phase))
+            yy = int(lerp(TERRACE_TOP, H, t))
+            pts.append((xx, yy))
+        polyline_disc(pts, 3, (18, 30, 28), 255, step=4)
+
+
+def draw_shimmer():
+    """The jellyfish's pink shimmer, rippling down the flooded terraces."""
+    for x in range(408, 620, 9):
+        for y in range(TERRACE_TOP + 4, H - 4, 3):
+            wob = int(7 * math.sin(y * 0.028 + x * 0.05))
+            depth = (y - TERRACE_TOP) / (H - TERRACE_TOP)
+            alpha = int(70 * (1.0 - depth * 0.75))
+            blend_span(y, x + wob, x + wob + 3, (255, 170, 205), alpha)
+
 
 # -------------------------------------------------------------- jellyfish
-# Bell: a true half-ellipse, smooth per-row gradient, darker and more
-# saturated toward the rim edge. Center (512, 332), radii (335, 245).
-DOME_CX = 512
-DOME_CY = 332      # rim line
-DOME_A = 335       # horizontal radius
-DOME_B = 245       # vertical radius
-DOME_TOP = (238, 228, 252)    # pale lavender-white at the crown
-DOME_MID = (206, 176, 236)
-DOME_LOW = (172, 138, 214)
-DOME_EDGE = (118, 78, 176)    # saturated violet toward the edge
+
+JX, JY = 512, 330          # bell centre
+JRX, JRY = 238, 172        # bell radii
+BELL_TOP = (255, 226, 242)
+BELL_MID = (236, 118, 202)
+BELL_EDGE = (150, 70, 206)
 
 
-def dome_row_color(y):
-    """Vertical gradient of the bell at row y (top -> rim)."""
-    t = (y - (DOME_CY - DOME_B)) / DOME_B  # 0 at crown, 1 at rim
-    if t < 0.5:
-        return lerp_color(DOME_TOP, DOME_MID, t * 2.0)
-    return lerp_color(DOME_MID, DOME_LOW, (t - 0.5) * 2.0)
+def draw_jellyfish_glow():
+    """Wide soft halo so the bell reads as a light source."""
+    disc(JX, JY, 330, (255, 120, 190), 18)
+    disc(JX, JY, 290, (255, 140, 200), 26)
+    disc(JX, JY + 40, 260, (200, 120, 235), 22)
 
 
-def draw_dome():
-    # Halo of light breathing above the bell, drawn first so the bell
-    # sits inside it.
-    radial_glow(512, 120, 400, 150, 190, 150, 235, 0.22, step=2)
-    for y in range(DOME_CY - DOME_B, DOME_CY + 1):
-        t = (y - DOME_CY) / DOME_B  # -1 at crown .. 0 at rim
-        hw = DOME_A * math.sqrt(max(0.0, 1.0 - t * t))
-        if hw < 1:
-            continue
-        base = dome_row_color(y)
-        x0 = int(DOME_CX - hw)
-        x1 = int(DOME_CX + hw)
-        row = y * W
-        for x in range(x0, x1 + 1):
-            u = abs(x - DOME_CX) / hw  # 0 centre .. 1 edge
-            e = u * u * 0.55
-            i = (row + x) * 3
-            px[i] = int(base[0] + (DOME_EDGE[0] - base[0]) * e + 0.5)
-            px[i + 1] = int(base[1] + (DOME_EDGE[1] - base[1]) * e + 0.5)
-            px[i + 2] = int(base[2] + (DOME_EDGE[2] - base[2]) * e + 0.5)
-    # Bright core glowing inside the crown of the bell.
-    radial_glow(512, 165, 170, 85, 250, 246, 255, 0.42, step=1)
-    radial_glow(512, 165, 110, 55, 255, 255, 255, 0.30, step=1)
+def draw_bell():
+    """The dome: bright apex fading to violet at the rim, translucent."""
+    for y, x0, x1 in ellipse_rows(JX, JY, JRX, JRY):
+        # Radial brightness: hottest near the apex, cooler toward the rim.
+        ny = (y - (JY - JRY)) / (2 * JRY)          # 0 top .. 1 bottom
+        cx_mid = (x0 + x1) // 2
+        nx = abs(cx_mid - JX) / JRX
+        heat = _clamp(1.0 - (ny * 0.55 + nx * 0.45), 0.15, 1.0)
+        col = mix(BELL_EDGE, mix(BELL_MID, BELL_TOP, heat), heat)
+        alpha = 235 if heat > 0.55 else 215
+        blend_span(y, x0, x1, col, alpha)
+    # Bright core just under the apex.
+    disc(JX, JY - 58, 74, (255, 240, 250), 120)
+    disc(JX, JY - 58, 44, (255, 250, 252), 150)
 
 
 def draw_ribs():
-    # Ribs radiate from a point inside the bell out to its rim, each
-    # bowed slightly so they read as curved membrane ribs, not spokes.
-    ax, ay = 512, 200
-    for deg in (200, 220, 240, 260, 280, 300, 320, 340):
-        th = math.radians(deg)
-        rx = int(DOME_CX + DOME_A * math.cos(th) + 0.5)
-        ry = int(DOME_CY + DOME_B * math.sin(th) + 0.5)
-        mx = (ax + rx) // 2
-        my = (ay + ry) // 2
-        # Bow the midpoint sideways, away from the bell's centre line.
-        bow = 14 if rx >= ax else -14
-        line(ax, ay, mx + bow, my, 240, 170, 205, width=2, a=0.6)
-        line(mx + bow, my, rx, ry, 240, 170, 205, width=2, a=0.6)
+    """Curved ribs fanning from the apex to the rim."""
+    apex = (JX, JY - JRY + 8)
+    for k in range(-5, 6):
+        ang = k * 0.30
+        ex = int(JX + math.sin(ang) * (JRX - 14))
+        ey = int(JY + JRY * 0.55)
+        mid = (int((apex[0] + ex) / 2 + k * 12), int((apex[1] + ey) / 2 - 30))
+        pts = [apex, mid, (ex, ey)]
+        polyline_disc(pts, 5, (255, 205, 235), 150, step=4)
 
 
 def draw_skirt():
-    # Wavy translucent frill along the rim, with a bright rim line and
-    # small pale dots studded along it.
-    for x in range(DOME_CX - DOME_A, DOME_CX + DOME_A + 1, 2):
-        y = int(DOME_CY + 6 + 5 * math.sin(x * 2 * math.pi / 48.0) + 0.5)
-        disc(x, y, 3, 235, 150, 195, a=0.9)
-    hline(DOME_CY, DOME_CX - DOME_A, DOME_CX + DOME_A, 250, 190, 215)
-    hline_a(DOME_CY + 1, DOME_CX - DOME_A, DOME_CX + DOME_A,
-            250, 190, 215, 0.6)
-    for x in range(DOME_CX - DOME_A + 18, DOME_CX + DOME_A, 42):
-        disc(x, DOME_CY - 4, 2, 255, 235, 245, a=0.85)
+    """Wavy translucent oral skirt along the bell's lower rim."""
+    for x in range(JX - JRX + 6, JX + JRX - 5):
+        t = (x - (JX - JRX)) / (2 * JRX)
+        rest = 1.0 - ((x - JX) / JRX) ** 2
+        if rest < 0:
+            continue
+        edge = int(JY + JRY * math.sqrt(rest) * 0.92)
+        wave = int(16 * math.sin(x * 0.055) + 8 * math.sin(x * 0.13 + 1.0))
+        fill_vspan(x, edge - 6, edge + wave + 18, (226, 130, 205))
+        blend_span(edge + wave + 10, x, x + 1, (255, 190, 225), 120)
+    # Scalloped fringe: overlapping discs under the skirt edge.
+    for x in range(JX - JRX + 10, JX + JRX - 9, 16):
+        rest = 1.0 - ((x - JX) / JRX) ** 2
+        if rest < 0:
+            continue
+        edge = int(JY + JRY * math.sqrt(rest) * 0.92)
+        wave = int(16 * math.sin(x * 0.055) + 8 * math.sin(x * 0.13 + 1.0))
+        disc(x, edge + wave + 12, 11, (240, 150, 215), 200)
 
 
-def draw_arms():
-    # Five thick oral arms: wavy pink ribbons with a lighter core,
-    # tapering gently toward the tip, hanging from the rim.
-    for k, base_x in enumerate((335, 425, 512, 600, 690)):
-        phase = k * 1.7
-        length = 565 + (k % 2) * 22 + (18 if k == 2 else 0)
-        y0 = DOME_CY + 12
-        y = y0
-        while y <= length:
-            frac = (y - y0) / max(1, length - y0)
-            outer = 11 - int(4 * frac)
-            inner = max(3, outer - 6)
-            x = int(base_x
-                    + 14 * math.sin((y - DOME_CY) * 0.030 + phase)
-                    + 6 * math.sin((y - DOME_CY) * 0.011 + phase * 0.5)
-                    + 0.5)
-            disc(x, y, outer, 244, 160, 198, a=0.92)
-            disc(x, y, inner, 255, 205, 225, a=0.95)
-            y += 2
+def draw_oral_arms():
+    """Five thick frilled oral arms hanging from the bell's centre."""
+    for i, off in enumerate((-132, -66, 0, 66, 132)):
+        phase = i * 1.15
+        length = 150 + (i % 2) * 26
+        pts = []
+        for s in range(0, length + 1, 6):
+            xx = int(JX + off + 20 * math.sin(s * 0.022 + phase))
+            yy = JY + JRY - 30 + s
+            pts.append((xx, yy))
+        polyline_disc(pts, 14, (255, 128, 184), 235, step=4)
+        polyline_disc(pts, 7, (255, 190, 220), 200, step=4)
 
 
 def draw_tentacles():
-    # Many thin, delicate tentacles between and beside the oral arms.
-    seed = 987654
-    for n in range(38):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        base_x = 200 + (seed % 630)
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        length = 520 + (seed % 85)
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        amp = 6 + (seed % 7)
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        phase = (seed % 628) / 100.0
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        drift = ((seed % 41) - 20) / 10.0
-        y = DOME_CY + 8
-        while y <= length:
-            x = int(base_x + amp * math.sin((y - DOME_CY) * 0.045 + phase)
-                    + drift * (y - DOME_CY) / 200.0 + 0.5)
-            blend_px(x, y, 245, 200, 220, 0.85)
-            if n % 5 == 0:
-                blend_px(x + 1, y, 245, 200, 220, 0.6)
-            y += 2
-
-# ------------------------------------------------- farmer, lanterns, scale
-DARK = (24, 14, 38)
+    """Many fine tentacles trailing down, swaying as they fall."""
+    for i in range(18):
+        off = -215 + i * 25
+        phase = i * 0.9
+        length = 170 + int(90 * abs(math.sin(i * 1.7)))
+        pts = []
+        for s in range(0, length + 1, 5):
+            xx = int(JX + off + 12 * math.sin(s * 0.03 + phase))
+            yy = JY + JRY - 18 + s
+            pts.append((xx, yy))
+        polyline_disc(pts, 2, (255, 170, 215), 210, step=3)
 
 
-def draw_lantern(x, base_y):
-    # Thin dark post with a warm glowing orb on top.
-    top_y = base_y - 26
-    line(x, base_y, x, top_y, *DARK, width=2)
-    radial_glow(x, top_y, 20, 20, 255, 184, 77, 0.55, step=1)
-    disc(x, top_y, 6, 255, 210, 122)
-    disc(x, top_y, 3, 255, 238, 190)
+# --------------------------------------------------------- farmer, lanterns
+
+def draw_farmer():
+    """Tiny farmer silhouette with a conical hat, for scale."""
+    fx, fy = 318, 918
+    dark = (14, 12, 22)
+    # Conical hat.
+    for i in range(12):
+        w = 4 + i * 2
+        fill_span(fy - 34 + i, fx - w // 2, fx + w // 2 + 1, dark)
+    # Head, torso, legs.
+    disc(fx, fy - 18, 6, dark)
+    for i in range(16):
+        w = 7 + (i // 4)
+        fill_span(fy - 12 + i, fx - w, fx + w + 1, dark)
+    fill_span(fy + 4, fx - 5, fx - 1, dark)
+    fill_span(fy + 4, fx + 1, fx + 6, dark)
+    for i in range(8):
+        fill_span(fy + 5 + i, fx - 5, fx - 2, dark)
+        fill_span(fy + 5 + i, fx + 2, fx + 5, dark)
 
 
-def draw_farmer(x, feet_y):
-    # Tiny farmer in a conical hat, standing on a terrace line.
-    # Hat (golden cone).
-    polyfill([(x - 12, feet_y - 22), (x + 12, feet_y - 22),
-              (x, feet_y - 34)], 216, 162, 74)
-    # Body: dark robe.
-    polyfill([(x - 5, feet_y - 22), (x + 5, feet_y - 22),
-              (x + 4, feet_y), (x - 4, feet_y)], *DARK)
-    # Legs.
-    line(x - 2, feet_y - 1, x - 3, feet_y + 4, *DARK, width=2)
-    line(x + 2, feet_y - 1, x + 3, feet_y + 4, *DARK, width=2)
+def draw_lanterns():
+    """Three warm lanterns glowing beside the farmer."""
+    for (lx, ly, r) in [(272, 896, 7), (368, 902, 8), (412, 888, 6)]:
+        disc(lx, ly, r + 16, (255, 150, 60), 46)
+        disc(lx, ly, r + 8, (255, 180, 90), 90)
+        disc(lx, ly, r, (255, 214, 140), 255)
+        disc(lx, ly, max(2, r - 3), (255, 244, 200), 255)
+        # Pole down to the ground.
+        fill_vspan(lx, ly + r, ly + 26, (14, 12, 22))
 
 
-def draw_scale_figures():
-    # Farmer + three lanterns on the 6th terrace curve (edge 856, sag 64),
-    # and a second tiny figure far down the field at bottom right.
-    for lx in (355, 500, 560):
-        draw_lantern(lx, int(terrace_y(856, 64, lx) + 0.5))
-    draw_farmer(410, int(terrace_y(856, 64, 410) + 0.5))
-    fx, fy = 880, 972
-    polyfill([(fx - 5, fy - 16), (fx + 5, fy - 16),
-              (fx + 4, fy), (fx - 4, fy)], *DARK)
-    disc(fx, fy - 19, 3, *DARK)
+# -------------------------------------------------------------------- png
+
+def png_bytes():
+    """Encode the RGB buffer as a deterministic PNG (filter 0 rows)."""
+    raw = bytearray()
+    stride = W * 3
+    for y in range(H):
+        raw.append(0)
+        raw += buf[y * stride:(y + 1) * stride]
+    data = zlib.compress(bytes(raw), 9)
+
+    def chunk(kind, payload):
+        c = struct.pack(">I", len(payload)) + kind + payload
+        return c + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", data) + chunk(b"IEND", b""))
 
 
-# ------------------------------------------------------------------ draw
-def draw():
+def main():
     draw_sky()
-    draw_stars()
     draw_sun()
+    draw_clouds()
     draw_mountains()
-    draw_birds()
     draw_terraces()
-    draw_dome()
+    draw_shimmer()
+    draw_jellyfish_glow()
+    draw_bell()
     draw_ribs()
     draw_skirt()
-    draw_arms()
+    draw_oral_arms()
     draw_tentacles()
-    draw_scale_figures()
+    draw_farmer()
+    draw_lanterns()
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "entry.png")
+    with open(path, "wb") as f:
+        f.write(png_bytes())
+    print("wrote", path)
 
 
 if __name__ == "__main__":
